@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scipy.spatial
+import numexpr as ne
 
 
 def derivative(func):
@@ -11,6 +12,17 @@ def derivative(func):
     """
     h = 0.000000000001
     return lambda x: (func(x+h) - func(x))/h
+
+
+def covariance(x, y):
+    N = len(x)
+    assert len(x) == len(y)
+
+    mu_x = np.mean(x)
+    mu_y = np.mean(y)
+
+    cov_xy = np.sum((x - mu_x) * (y - mu_y))/N
+    return cov_xy
 
 
 class MetricSpace():
@@ -37,6 +49,7 @@ class MetricSpace():
         distance matrix separately.
         """
         self.distance_matrix_ = distance_matrix_
+        self.partial_distance_matrix = None
 
     def __repr__(self):
         """
@@ -53,26 +66,64 @@ class MetricSpace():
 
         This is a vectorised implementation.
         """
+
+        ne.evaluate("exp(-1*matrix)", out=matrix)
+        return np.sum(1/np.sum(matrix, axis=0))
+
+    @staticmethod
+    def _spread(matrix):
+        """
+        The spread of a metric space as defined by Simon Willerton.
+        The spread here is implemented as a function on the distance
+        matrix.
+
+        This is a vectorised implementation.
+        """
         D = matrix
-        J = np.ones(len(D))
         E = np.exp(-1*D)
-        return np.sum(1/(E@J))
+        return np.sum(1/np.sum(E, axis=0))
 
     @staticmethod
     def pseudo_spread(partial_matrix):
 
-        list_of_pseudo_spread_values = []
-        for row in partial_matrix:
-            list_of_pseudo_spread_values.append(
-                np.exp(-1*row).sum()
-            )
+        D = np.sum(np.exp(-1*partial_matrix), axis=1)
+        return 1/D
 
-        return np.array(list_of_pseudo_spread_values)
+    def pseudo_spread_dimension_exact(self, t):
+        """
+        Returns the spread dimension of distance
+        matrix when scaled by a factor of t.
+
+        This is a vectorised implementation of the
+        exact formula for spread dimension of a finite
+        metric space.
+        """
+
+        n, m = self.partial_distance_matrix.shape
+
+        D = self.partial_distance_matrix
+        E = ne.evaluate("exp(-t*D)")
+        Y = MetricSpace.pseudo_spread(t*D)
+        varY = np.std(Y)**2
+
+        X = np.sum(D*E, axis=1)/(np.sum(E, axis=1)**2)
+        varX = np.std(X)**2
+
+        covXY = covariance(X, Y)
+
+        x = np.sum(X)/n
+        y = np.sum(Y)/n
+        G = t * x/y
+
+        varG = (G**2)*(varY/(y**2) + varX/(x**2) - 2*covXY/(x*y))
+        CI = 1.9 * np.sqrt(varG)/np.sqrt(n)
+
+        return G, CI
 
     def pseudo_spread_dimension_numerical(self, t):
 
         results = []
-        for row in self.partial_distance_matrix_:
+        for row in self.partial_distance_matrix:
 
             def f(t): return MetricSpace.spread(t*row)
             f_prime = derivative(f)
@@ -89,11 +140,31 @@ class MetricSpace():
         This is a vectorised implementation of the
         exact formula for spread dimension of a finite
         metric space.
+
+        Optimised using NumExpr.
         """
         D = self.distance_matrix_
-        J = np.ones(len(D))
+        E = ne.evaluate("exp(-t*D)")
+
+        lead_factor = (t/MetricSpace.spread(t*D))
+
+        denomenator = np.sum(E, axis=0)**2
+        ne.evaluate("D*E", out=E)
+        return lead_factor * np.sum(np.sum(E, axis=0)/denomenator)
+
+    def _spread_dimension_exact(self, t):
+        """
+        Returns the spread dimension of distance
+        matrix when scaled by a factor of t.
+
+
+        Implemented using numpy only.
+        """
+        D = self.distance_matrix_
         E = np.exp(-t*D)
-        return (t/MetricSpace.spread(t*D)) * np.sum(((D*E)@J)/((E@J)**2))
+        A = (t/MetricSpace.spread(t*D))
+        B = np.sum((np.sum(D*E, axis=0))/(np.sum(E, axis=0)**2))
+        return A*B
 
     def spread_dimension_numerical(self, t):
         """
@@ -368,13 +439,15 @@ class EuclideanSubspace(MetricSpace):
 
         uses scipy implementation of distance_matrix for speed
         """
+        D = scipy.spatial.distance.pdist(self.points, metric='euclidean')
+        self.distance_matrix_ = scipy.spatial.distance.squareform(D)
 
-        self.distance_matrix_ = scipy.spatial.distance_matrix(
-            self.points,
-            self.points,
-            p=p_norm,
-            threshold=100000000
-        )
+#        self.distance_matrix_ = scipy.spatial.distance_matrix(
+#            self.points,
+#            self.points,
+#            p=p_norm,
+#            threshold=100000000
+#        )
 
     def compute_partial_metric(self, p_norm=2, list_of_indices=[0]):
         """
@@ -394,7 +467,7 @@ class EuclideanSubspace(MetricSpace):
             chosen_points.append(self.points[i])
         chosen_points = np.array(chosen_points)
 
-        self.partial_distance_matrix_ = scipy.spatial.distance_matrix(
+        self.partial_distance_matrix = scipy.spatial.distance_matrix(
             chosen_points,
             self.points,
             p=p_norm,
